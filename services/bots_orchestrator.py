@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 import docker
+from docker.errors import DockerException
 
 from database import AsyncDatabaseManager, BotRunRepository, ControllerPerformanceRepository
 from services.docker_service import DockerService
@@ -26,8 +27,14 @@ class BotsOrchestrator:
         self.broker_username = broker_username
         self.broker_password = broker_password
 
-        # Initialize Docker client
-        self.docker_client = docker.from_env()
+        # None when the daemon could not be reached. Container discovery is one of two
+        # sources for the active-bot list (MQTT is the other), so an absent daemon costs
+        # discovery, not startup -- previously this raised and took the whole API down.
+        self.docker_client = None
+        try:
+            self.docker_client = docker.from_env()
+        except DockerException as e:
+            logger.error(f"Bot container discovery is unavailable without Docker: {e}")
 
         # Initialize MQTT manager
         self.mqtt_manager = MQTTManager(host=broker_host, port=broker_port, username=broker_username, password=broker_password)
@@ -64,6 +71,9 @@ class BotsOrchestrator:
         return await loop.run_in_executor(None, self._sync_get_active_containers)
 
     def _sync_get_active_containers(self):
+        # Polled every second; without the daemon this would log the same error forever.
+        if self.docker_client is None:
+            return []
         return [
             container.name
             for container in self.docker_client.containers.list()

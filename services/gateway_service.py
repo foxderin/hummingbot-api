@@ -35,11 +35,31 @@ class GatewayService:
         self.SOURCE_PATH = os.getcwd()
         # Use BOTS_PATH if set (for Docker), otherwise use SOURCE_PATH (for local)
         self.BOTS_PATH = os.environ.get('BOTS_PATH', self.SOURCE_PATH)
+        # None when the daemon could not be reached. Every container lookup below already
+        # turns a DockerException into None (meaning "no such container"), which is also
+        # the right answer when there is no daemon to ask -- so those paths need no change.
+        # Without this, construction raised and took the whole API down with it.
+        self.client = None
         try:
             self.client = docker.from_env()
         except DockerException as e:
             logger.error(f"Failed to connect to Docker. Error: {e}")
-            raise
+
+    @property
+    def _client(self):
+        """The daemon handle, or a DockerException when there is no daemon.
+
+        `start()` is the only method here that builds containers; it catches
+        DockerException and returns a readable failure. The lookups raise from inside
+        handlers that already map DockerException to None ("no such container"), which is
+        also the correct answer when there is no daemon to ask.
+        """
+        if self.client is None:
+            raise DockerException(
+                "This API was started without a Docker daemon; the Gateway cannot be "
+                "managed. Mount /var/run/docker.sock into the API container to enable it."
+            )
+        return self.client
 
     def _gateway_base(self, host: bool = False) -> str:
         """Gateway-files base. host=False is the path the API process reads/writes
@@ -73,7 +93,7 @@ class GatewayService:
     def _get_gateway_container(self) -> Optional[docker.models.containers.Container]:
         """Get the Gateway container if it exists"""
         try:
-            return self.client.containers.get(self.GATEWAY_CONTAINER_NAME)
+            return self._client.containers.get(self.GATEWAY_CONTAINER_NAME)
         except docker.errors.NotFound:
             return None
         except DockerException as e:
@@ -149,7 +169,7 @@ class GatewayService:
 
         for ident in candidates:
             try:
-                return self.client.containers.get(ident)
+                return self._client.containers.get(ident)
             except (docker.errors.NotFound, DockerException):
                 continue
         return None
@@ -206,6 +226,15 @@ class GatewayService:
         Start the Gateway container.
         If a container already exists, it will be stopped and removed before creating a new one.
         """
+        # Refuse before touching the filesystem: without a daemon this would create
+        # directories and generate a cert set for a Gateway that can never start.
+        if self.client is None:
+            return {
+                "success": False,
+                "message": "Gateway cannot be started: this API was launched without a Docker "
+                           "daemon. Mount /var/run/docker.sock into the API container to enable it."
+            }
+
         # Check if Gateway is already running
         existing_container = self._get_gateway_container()
         if existing_container:
@@ -297,7 +326,7 @@ class GatewayService:
                 # loopback-scoped here; mTLS is the control there.
                 container_config["ports"] = {'15888/tcp': ('127.0.0.1', config.port)}
 
-            container = self.client.containers.run(**container_config)
+            container = self._client.containers.run(**container_config)
 
             # On macOS/Windows, attach the Gateway to the same Docker network(s) the API
             # container is on so it's reachable by container name (https://gateway:15888).
@@ -311,7 +340,7 @@ class GatewayService:
                 connected = False
                 for net in target_networks:
                     try:
-                        network = self.client.networks.get(net)
+                        network = self._client.networks.get(net)
                         network.connect(container)
                         logger.info(f"Connected Gateway to {net} network")
                         connected = True

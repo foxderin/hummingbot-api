@@ -31,12 +31,36 @@ class DockerService:
         self._cleanup_thread = None
         self._stop_cleanup = threading.Event()
 
+        # None when the daemon could not be reached. This is the state the rest of the
+        # codebase already reads (routers/system.py and services/self_upgrade.py both do
+        # `getattr(docker_service, "client", None)`), so the API boots on a host that
+        # withholds the socket instead of dying at startup.
+        self.client = None
         try:
             self.client = docker.from_env()
             # Start background cleanup thread
             self._start_cleanup_thread()
         except DockerException as e:
+            self.client = None
             logger.error(f"It was not possible to connect to Docker. Please make sure Docker is running. Error: {e}")
+
+    @property
+    def _client(self):
+        """The daemon handle, or a raise in the shape every caller already handles.
+
+        The eleven methods below catch DockerException and turn it into `_failure(...)`.
+        Reading `self.client` directly would raise AttributeError instead whenever the
+        daemon is absent, which those handlers do not catch -- so the attribute is
+        replaced here by the same exception a dead daemon produces, and no method body
+        needed changing.
+        """
+        if self.client is None:
+            raise DockerException(
+                "This API was started without a Docker daemon; Docker operations are "
+                "unavailable. Mount /var/run/docker.sock into the API container to enable "
+                "bot and Gateway container management."
+            )
+        return self.client
 
     @staticmethod
     def _failure(message: str, error: str = "docker_error") -> Dict:
@@ -54,7 +78,7 @@ class DockerService:
 
     def get_active_containers(self, name_filter: str = None):
         try:
-            all_containers = self.client.containers.list(filters={"status": "running"})
+            all_containers = self._client.containers.list(filters={"status": "running"})
             if name_filter:
                 containers_info = [
                     {
@@ -82,7 +106,7 @@ class DockerService:
 
     def get_available_images(self):
         try:
-            images = self.client.images.list()
+            images = self._client.images.list()
             return {"images": images}
         except DockerException as e:
             logger.error(f"Error listing images: {e}")
@@ -90,21 +114,21 @@ class DockerService:
 
     def pull_image(self, image_name):
         try:
-            return self.client.images.pull(image_name)
+            return self._client.images.pull(image_name)
         except DockerException as e:
             return str(e)
 
     def pull_image_sync(self, image_name):
         """Synchronous pull operation for background tasks"""
         try:
-            result = self.client.images.pull(image_name)
+            result = self._client.images.pull(image_name)
             return {"success": True, "image": image_name, "result": str(result)}
         except DockerException as e:
             return {"success": False, "error": str(e)}
 
     def get_exited_containers(self, name_filter: str = None):
         try:
-            all_containers = self.client.containers.list(filters={"status": "exited"}, all=True)
+            all_containers = self._client.containers.list(filters={"status": "exited"}, all=True)
             if name_filter:
                 containers_info = [
                     {
@@ -132,7 +156,7 @@ class DockerService:
 
     def clean_exited_containers(self):
         try:
-            self.client.containers.prune()
+            self._client.containers.prune()
             return {"success": True, "message": "Exited containers removed."}
         except DockerException as e:
             logger.error(f"Error pruning exited containers: {e}")
@@ -140,7 +164,7 @@ class DockerService:
 
     def is_docker_running(self):
         try:
-            self.client.ping()
+            self._client.ping()
             return True
         except DockerException:
             return False
@@ -154,7 +178,7 @@ class DockerService:
         tolerate a stop that did not take.
         """
         try:
-            container = self.client.containers.get(container_name)
+            container = self._client.containers.get(container_name)
             container.stop()
             return {"success": True, "message": f"Container {container_name} stopped."}
         except NotFound:
@@ -165,7 +189,7 @@ class DockerService:
 
     def start_container(self, container_name):
         try:
-            container = self.client.containers.get(container_name)
+            container = self._client.containers.get(container_name)
             container.start()
             return {"success": True, "message": f"Container {container_name} started."}
         except NotFound:
@@ -177,7 +201,7 @@ class DockerService:
     def get_container_status(self, container_name):
         """Get the status of a container"""
         try:
-            container = self.client.containers.get(container_name)
+            container = self._client.containers.get(container_name)
             return {
                 "success": True,
                 "state": {
@@ -194,7 +218,7 @@ class DockerService:
 
     def remove_container(self, container_name, force=True):
         try:
-            container = self.client.containers.get(container_name)
+            container = self._client.containers.get(container_name)
             container.remove(force=force)
             return {"success": True, "message": f"Container {container_name} removed successfully."}
         except NotFound:
@@ -396,7 +420,7 @@ class DockerService:
                 'max-file': "5",
             })
         try:
-            self.client.containers.run(
+            self._client.containers.run(
                 image=config.image,
                 name=instance_name,
                 volumes=volumes,
